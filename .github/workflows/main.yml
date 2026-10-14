@@ -1,0 +1,38 @@
+name: Trend Template Scanner
+
+on:
+  schedule:
+    # 하루 1회, 미국 장 마감 후 (UTC 21:55 = 한국 06:55)
+    - cron: "55 21 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "주말에도 실행 (최근 거래일 기준)"
+        type: boolean
+        default: true
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # 종목 목록·회사명 캐시를 다음 실행으로 넘김
+      - uses: actions/cache@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - run: python trend.py
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
