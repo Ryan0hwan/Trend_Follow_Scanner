@@ -3,6 +3,7 @@
 - S&P 500 + 내 관심종목에서 마크 미너비니 추세 템플릿 8개 조건을 매일 확인해
 - ① 8개를 모두 만족하는 종목 전체
 - ② 그중 최근 10거래일 안에 새로 템플릿에 들어온 종목 (B, 과열 제외)
+- ③ 그중 오늘 20일·30일·50일 SMA에 ±0.5% 이내로 닿은 종목 (눌림)
   을 디스코드로 따로 보냅니다.
 """
 import datetime as dt
@@ -29,6 +30,9 @@ SLOPE_DAYS = int(os.environ.get("SLOPE_DAYS", "21"))            # 3. 200일선 �
 
 NEW_DAYS = int(os.environ.get("NEW_DAYS", "10"))                # B. 템플릿에 들어온 지 이 거래일 이내
 MAX_ABOVE_50 = float(os.environ.get("MAX_ABOVE_50", "25"))      # B. 과열 제외: 50일선 위 이 % 초과면 제외
+
+TOUCH_MAS = [int(x) for x in os.environ.get("TOUCH_MAS", "20,30,50").split(",")]  # ③ 눌림 확인할 이평선(SMA)
+TOUCH_TOL_PCT = float(os.environ.get("TOUCH_TOL_PCT", "0.5"))   # ③ 당일 저가~고가가 선의 ±0.5% 안에 걸치면 터치
 
 MIN_PRICE = float(os.environ.get("MIN_PRICE", "5"))
 MIN_DOLLAR_VOL = float(os.environ.get("MIN_DOLLAR_VOL", "5000000"))  # 50일 평균 거래대금($)
@@ -138,6 +142,8 @@ def price_checks(df: pd.DataFrame) -> pd.DataFrame | None:
         "score": rs_score(c),
         "close": c,
         "above50": (c / s50 - 1) * 100,
+        "high": h, "low": l,
+        **{f"sma{n}": c.rolling(n).mean() for n in TOUCH_MAS},
         "from_hi": (c / hi52 - 1) * 100,
         "from_lo": (c / lo52 - 1) * 100,
         "r1m": (c / c.shift(21) - 1) * 100,
@@ -179,6 +185,8 @@ def evaluate(per_ticker: dict[str, pd.DataFrame]) -> pd.DataFrame:
             "close": float(today["close"]), "above50": float(today["above50"]),
             "from_hi": float(today["from_hi"]), "from_lo": float(today["from_lo"]),
             "r1m": float(today["r1m"]), "r3m": float(today["r3m"]),
+            "high": float(today["high"]), "low": float(today["low"]),
+            **{f"sma{n}": float(today[f"sma{n}"]) for n in TOUCH_MAS},
             "date": str(today["date"]),
         })
     return pd.DataFrame(rows)
@@ -239,6 +247,34 @@ def send_table(title: str, rows: list[dict], with_name: bool):
         first, part = False, part + 1
 
 
+def send_touch_table(title: str, rows: list[dict]):
+    gaps = "".join(f"{f'{n}D%':>7}" for n in TOUCH_MAS)
+    head = f"{'TICKER':<7}{'NAME':<16}{'RS':>3}{'LINE':>9}{'DAYS':>5}{'LAST':>9}{gaps}"
+    def line(r):
+        d = r["days"]
+        days = f"{NEW_DAYS}+" if d is None or (isinstance(d, float) and np.isnan(d)) else str(int(d))
+        g = "".join(f"{(r['close'] / r[f'sma{n}'] - 1) * 100:>+7.1f}" for n in TOUCH_MAS)
+        return f"{r['t']:<7}{r['name'][:14]:<16}{r['rs']:>3}{r['line']:>9}{days:>5}{r['close']:>9.2f}{g}"
+    lines = [line(r) for r in rows]
+    first, part = True, 1
+    while lines:
+        block, size = [], 0
+        while lines and size + len(lines[0]) + 1 < 1750:
+            size += len(lines[0]) + 1
+            block.append(lines.pop(0))
+        header = f"**{title}**\n" if first else f"**{title} ({part})**\n"
+        post(f"{header}```\n{head}\n" + "\n".join(block) + "\n```")
+        first, part = False, part + 1
+
+
+def touched_lines(r: dict) -> str:
+    """오늘 저가~고가가 선의 ±TOUCH_TOL_PCT 안에 걸친 이평선 목록 (예: '20,50')"""
+    tol = TOUCH_TOL_PCT / 100
+    hit = [str(n) for n in TOUCH_MAS
+           if not np.isnan(r[f"sma{n}"]) and r["low"] <= r[f"sma{n}"] * (1 + tol) and r["high"] >= r[f"sma{n}"] * (1 - tol)]
+    return ",".join(hit)
+
+
 # ───────────── 실행 ─────────────
 def main():
     now = dt.datetime.now(NY)
@@ -282,13 +318,24 @@ def main():
 
     # ② B: 최근 NEW_DAYS일 안에 새로 진입 + 과열 제외
     newb = res[res["days"].notna() & (res["above50"] <= MAX_ABOVE_50)].sort_values(["days", "rs"], ascending=[True, False])
+    # ③ 이평선 눌림: 오늘 20·30·50일선 중 하나라도 ±TOUCH_TOL_PCT 안에 닿은 종목
+    res["line"] = [touched_lines(r) for r in res.to_dict("records")]
+    touch = res[res["line"] != ""].sort_values("rs", ascending=False)
     dstr = f"{asof:%b} {asof.day}"
+    ma_txt = "·".join(str(n) for n in TOUCH_MAS)
     post(f"**{dstr} | 미너비니 추세 템플릿**\n"
-         f"8개 조건 모두 충족 **{len(res)}**종목 · 그중 최근 {NEW_DAYS}거래일 신규 진입 **{len(newb)}**종목 (과열 제외)")
+         f"8개 조건 모두 충족 **{len(res)}**종목\n"
+         f"그중 최근 {NEW_DAYS}거래일 신규 진입 **{len(newb)}**종목 (과열 제외) · "
+         f"{ma_txt}일선 ±{TOUCH_TOL_PCT:g}% 눌림 **{len(touch)}**종목")
     if len(newb):
         send_table(f"② 신규 진입 (B) — {NEW_DAYS}거래일 이내, 50일선 +{MAX_ABOVE_50:.0f}% 이하", newb.to_dict("records"), True)
     else:
         post(f"② 신규 진입 (B): 오늘은 해당 종목이 없습니다.")
+
+    if len(touch):
+        send_touch_table(f"③ 이평선 눌림 — {ma_txt}일선 ±{TOUCH_TOL_PCT:g}% 터치", touch.to_dict("records"))
+    else:
+        post(f"③ 이평선 눌림 ({ma_txt}일선 ±{TOUCH_TOL_PCT:g}%): 오늘은 해당 종목이 없습니다.")
 
     # ① 8개 모두 충족 전체 (그룹별)
     for g in universes:
@@ -298,7 +345,7 @@ def main():
 
     if scanned < len(meta) * 0.5:
         post(f"⚠️ 추세 템플릿 스캐너: 시세를 {scanned}/{len(meta)}종목만 받았습니다. 일시적 오류일 수 있습니다.")
-    print(f"완료: {asof}, 확인 {len(per_ticker)}종목, 충족 {len(res)}, 신규 {len(newb)}")
+    print(f"완료: {asof}, 확인 {len(per_ticker)}종목, 충족 {len(res)}, 신규 {len(newb)}, 눌림 {len(touch)}")
 
 
 if __name__ == "__main__":
